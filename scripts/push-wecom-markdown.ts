@@ -2,17 +2,24 @@
  * 将 Markdown 推送到企业微信机器人（供 Cloud Automation / 本地脚本共用）
  *
  * 环境变量:
- *   WECOM_BOT_ID, WECOM_BOT_SECRET — 机器人凭据
+ *   WECOM_BOT_ID, WECOM_BOT_SECRET — 机器人凭据（直连 WebSocket 时必填）
  *   WECOM_CHAT_ID — 接收人 chatid（默认 LiuHaoCheng）
+ *   WECOM_PUSH_DIRECT=1 — 强制 WebSocket 直连（忽略本地 server 队列）
  *
  * 用法:
  *   bun run scripts/push-wecom-markdown.ts --title "标题" --file report.md
  *   bun run scripts/push-wecom-markdown.ts --title "标题" --text "内容"
  *   echo "内容" | bun run scripts/push-wecom-markdown.ts --title "标题"
+ *
+ * 本地 wecom/server 运行时默认走推送队列，避免与长连接互踢。
  */
 import AiBot from '@wecom/aibot-node-sdk';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import {
+	enqueueWecomPush,
+	isWecomPushServerRunning,
+} from '../shared/wecom-push-queue.ts';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const ENV_PATH = resolve(ROOT, 'wecom/.env');
@@ -51,30 +58,12 @@ function parseArgs(argv: string[]) {
 	return { title, file, text };
 }
 
-function chunkMarkdown(content: string, max = 2800): string[] {
-	if (content.length <= 3000) return [content];
-	const chunks: string[] = [];
-	for (let i = 0; i < content.length; i += max) chunks.push(content.slice(i, i + max));
-	return chunks;
-}
-
-async function main() {
-	const { title, file, text } = parseArgs(process.argv.slice(2));
-	const env = loadEnv();
+async function pushViaWebSocket(chatid: string, title: string, body: string, env: Record<string, string>) {
 	const botId = env.WECOM_BOT_ID;
 	const secret = env.WECOM_BOT_SECRET;
-	const chatid = env.WECOM_CHAT_ID || 'LiuHaoCheng';
-
 	if (!botId || !secret) {
 		throw new Error('缺少 WECOM_BOT_ID / WECOM_BOT_SECRET（Cloud Agent 密钥或 wecom/.env）');
 	}
-
-	let body = text ?? '';
-	if (file) body = readFileSync(resolve(file), 'utf-8');
-	if (!body && !process.stdin.isTTY) {
-		body = readFileSync(0, 'utf-8');
-	}
-	if (!body.trim()) throw new Error('无推送内容，请使用 --file / --text 或 stdin');
 
 	const wsClient = new AiBot.WSClient({ botId, secret });
 	await new Promise<void>((resolveConnect, reject) => {
@@ -90,7 +79,8 @@ async function main() {
 		wsClient.connect();
 	});
 
-	const chunks = chunkMarkdown(body.trim());
+	const { chunkWecomMarkdown } = await import('../shared/wecom-push-queue.ts');
+	const chunks = chunkWecomMarkdown(body.trim());
 	for (let i = 0; i < chunks.length; i++) {
 		const chunk = chunks[i]!;
 		const heading =
@@ -102,7 +92,30 @@ async function main() {
 		if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 400));
 	}
 
-	console.log(`[push-wecom] 已推送 ${chunks.length} 条消息到 ${chatid}`);
+	wsClient.disconnect();
+	console.log(`[push-wecom] WebSocket 已推送 ${chunks.length} 条消息到 ${chatid}`);
+}
+
+async function main() {
+	const { title, file, text } = parseArgs(process.argv.slice(2));
+	const env = loadEnv();
+	const chatid = env.WECOM_CHAT_ID || 'LiuHaoCheng';
+
+	let body = text ?? '';
+	if (file) body = readFileSync(resolve(file), 'utf-8');
+	if (!body && !process.stdin.isTTY) {
+		body = readFileSync(0, 'utf-8');
+	}
+	if (!body.trim()) throw new Error('无推送内容，请使用 --file / --text 或 stdin');
+
+	const useLocalQueue = env.WECOM_PUSH_DIRECT !== '1' && isWecomPushServerRunning(ROOT);
+	if (useLocalQueue) {
+		enqueueWecomPush(ROOT, { chatid, title, body: body.trim() });
+		console.log(`[push-wecom] 已写入本地推送队列 → ${chatid}（由 wecom/server 发送，避免 WebSocket 互踢）`);
+		process.exit(0);
+	}
+
+	await pushViaWebSocket(chatid, title, body, env);
 	process.exit(0);
 }
 

@@ -15,6 +15,11 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, watchFi
 import { resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { Scheduler, type CronJob } from '../shared/scheduler.js';
+import {
+	clearWecomPushServerPid,
+	drainWecomPushQueue,
+	writeWecomPushServerPid,
+} from '../shared/wecom-push-queue.js';
 import { MemoryManager } from '../shared/memory.js';
 import { HeartbeatRunner, getHeartbeatGlobalConfig, createSessionActivityGate, isHeartbeatEnabled } from '../shared/heartbeat.js';
 import { FeilianController, type OperationResult } from '../shared/feilian-control.js';
@@ -1063,7 +1068,11 @@ const scheduler = new Scheduler({
 						const workspace = job.workspace || defaultWorkspace;
 						const model = job.model || config.CURSOR_MODEL || getDefaultModel();
 						
-						const { result } = await runAgent(workspace, job.task.prompt, undefined, { source: 'scheduled' });
+						const { result } = await runAgent(workspace, job.task.prompt, undefined, {
+							source: 'scheduled',
+							platform: 'wecom',
+							webhook: job.webhook,
+						});
 						
 						return { status: 'ok' as const, result };
 					} catch (err) {
@@ -1124,7 +1133,11 @@ const scheduler = new Scheduler({
 				const workspace = job.workspace || defaultWorkspace;
 				const model = job.model || config.CURSOR_MODEL || getDefaultModel();
 				
-				const { result } = await runAgent(workspace, parsed.prompt, undefined, { source: 'scheduled' });
+				const { result } = await runAgent(workspace, parsed.prompt, undefined, {
+					source: 'scheduled',
+					platform: 'wecom',
+					webhook: job.webhook,
+				});
 				
 				return { status: 'ok' as const, result };
 			} catch (err) {
@@ -1240,6 +1253,19 @@ while (startRetries > 0) {
 			});
 		});
 		console.log('✅ 企业微信 WebSocket 已连接（SDK 自动管理重连）');
+		writeWecomPushServerPid(ROOT);
+		setInterval(() => {
+			drainWecomPushQueue(ROOT, async (chatid, content) => {
+				await wsClient.sendMessage(chatid, {
+					msgtype: 'markdown',
+					markdown: { content },
+				});
+			})
+				.then((n) => {
+					if (n > 0) console.log(`[push-queue] 已发送 ${n} 条队列消息`);
+				})
+				.catch((err) => console.error('[push-queue] 发送失败:', err));
+		}, 2000);
 		break;
 	} catch (err) {
 		startRetries--;
@@ -1286,6 +1312,7 @@ process.on('SIGINT', async () => {
 	}
 	
 	// 断开 WebSocket
+	clearWecomPushServerPid(ROOT);
 	wsClient.disconnect();
 	
 	console.log('[退出] 清理完成，再见！');
