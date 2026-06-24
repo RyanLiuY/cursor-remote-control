@@ -29,6 +29,14 @@ export type CronTaskPayload =
 	| { type: 'fetch-weather'; options?: { city?: string } }
 	| { type: 'fetch-github-trending'; options?: { since?: 'daily' | 'weekly' | 'monthly'; language?: string; topN?: number; translateDesc?: boolean } };
 
+/** 失败后重试策略（如邮件晨报：每 15 分钟重试直到当日成功） */
+export type CronRetryPolicy = {
+	intervalMs: number;
+	untilSuccess?: boolean;
+	maxRetriesPerDay?: number;
+	tz?: string;
+};
+
 export type CronJob = {
 	id: string;
 	name: string;
@@ -46,6 +54,7 @@ export type CronJob = {
 	model?: string;
 	platform?: 'feishu' | 'dingtalk' | 'wecom' | 'wechat' | 'telegram';  // 创建任务的平台
 	webhook?: string;  // 创建任务时的回调地址（钉钉）或 chatId（飞书/企业微信）
+	retryPolicy?: CronRetryPolicy;
 	createdAt: string;
 	updatedAt: string;
 	state: {
@@ -54,6 +63,8 @@ export type CronJob = {
 		lastStatus?: "ok" | "error" | "skipped";
 		lastError?: string;
 		consecutiveErrors?: number;
+		retriesToday?: number;
+		retryDayKey?: string;
 	};
 };
 
@@ -370,22 +381,34 @@ export class Scheduler {
 
 		job.state.lastRunAtMs = now;
 		job.state.lastStatus = status;
-		if (status === "error") {
-			job.state.lastError = error;
-			job.state.consecutiveErrors = (job.state.consecutiveErrors || 0) + 1;
-			this.log(`任务 "${job.name}" 失败 (${job.state.consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${error}`);
-			if (job.state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-				job.enabled = false;
-				this.log(`任务 "${job.name}" 连续失败 ${MAX_CONSECUTIVE_ERRORS} 次，已自动禁用`);
-			}
-		}
 
-		// One-shot "at" tasks: remove or disable after execution
+		let nextRunAtMs: number | undefined;
 		if (job.schedule.kind === "at") {
 			if (job.deleteAfterRun) this.jobs.delete(job.id);
 			else job.enabled = false;
 		} else {
-			job.state.nextRunAtMs = computeNextRun(job, now);
+			nextRunAtMs = scheduleNextAfterRun(job, now, status);
+			job.state.nextRunAtMs = nextRunAtMs;
+		}
+
+		const isIntradayRetry =
+			status === "error" &&
+			job.retryPolicy?.untilSuccess &&
+			nextRunAtMs != null &&
+			nextRunAtMs - now <= Math.max(60_000, job.retryPolicy.intervalMs) + 120_000;
+
+		if (status === "error") {
+			job.state.lastError = error;
+			if (!isIntradayRetry) {
+				job.state.consecutiveErrors = (job.state.consecutiveErrors || 0) + 1;
+				this.log(`任务 "${job.name}" 失败 (${job.state.consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${error}`);
+				if (job.state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+					job.enabled = false;
+					this.log(`任务 "${job.name}" 连续失败 ${MAX_CONSECUTIVE_ERRORS} 次，已自动禁用`);
+				}
+			} else {
+				this.log(`任务 "${job.name}" 失败，${new Date(nextRunAtMs!).toLocaleString("zh-CN", { timeZone: tzForJob(job) })} 重试 (${job.state.retriesToday}/${job.retryPolicy!.maxRetriesPerDay ?? 96}): ${error}`);
+			}
 		}
 
 		await this.save();
@@ -449,7 +472,60 @@ export class Scheduler {
 	}
 }
 
+function dayKeyInTz(ms: number, tz = "Asia/Shanghai"): string {
+	try {
+		return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+	} catch {
+		const d = new Date(ms);
+		return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+	}
+}
+
+function endOfDayMs(ms: number, tz = "Asia/Shanghai"): number {
+	const key = dayKeyInTz(ms, tz);
+	// Asia/Shanghai 固定 +08:00
+	return new Date(`${key}T23:59:59+08:00`).getTime();
+}
+
+function scheduleNextAfterRun(job: CronJob, now: number, status: "ok" | "error"): number | undefined {
+	const tz =
+		job.retryPolicy?.tz ??
+		(job.schedule.kind === "cron" ? job.schedule.tz : undefined) ??
+		"Asia/Shanghai";
+	const todayKey = dayKeyInTz(now, tz);
+	if (job.state.retryDayKey !== todayKey) {
+		job.state.retryDayKey = todayKey;
+		job.state.retriesToday = 0;
+	}
+
+	if (status === "ok" || !job.retryPolicy?.untilSuccess) {
+		job.state.retriesToday = 0;
+		return computeNextRun(job, now);
+	}
+
+	const interval = Math.max(60_000, job.retryPolicy.intervalMs);
+	const retryAt = now + interval;
+	const maxRetries = job.retryPolicy.maxRetriesPerDay ?? 96;
+	const retries = (job.state.retriesToday ?? 0) + 1;
+	job.state.retriesToday = retries;
+
+	if (retryAt <= endOfDayMs(now, tz) && retries <= maxRetries) {
+		return retryAt;
+	}
+
+	job.state.retriesToday = 0;
+	return computeNextRun(job, now);
+}
+
 // ── 工具函数 ──────────────────────────────────────
+function tzForJob(job: CronJob): string {
+	return (
+		job.retryPolicy?.tz ??
+		(job.schedule.kind === "cron" ? job.schedule.tz : undefined) ??
+		"Asia/Shanghai"
+	);
+}
+
 function formatDuration(ms: number): string {
 	if (ms < 0) return "已过期";
 	const seconds = Math.round(ms / 1000);

@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import type { Scheduler } from "./scheduler.js";
 import type { MemoryManager } from "./memory.js";
 import type { HeartbeatRunner } from "./heartbeat.js";
-import type { AgentExecutor } from "./agent-executor.js";
+import type { AgentExecutor, AgentStopSnapshot } from "./agent-executor.js";
 import { FeilianController, type OperationResult } from "./feilian-control.js";
 import { fetchNews } from "./news-fetcher.js";
 import { fetchWeather, getSupportedCities } from "./weather-fetcher.js";
@@ -65,6 +65,50 @@ export interface CommandContext {
 // ──────────────────────────────────────────────────
 // 工具函数
 // ──────────────────────────────────────────────────
+
+function formatStopReply(
+	snapshots: AgentStopSnapshot[],
+	triggerReason: string,
+	projectNameForWorkspace: (wsPath: string) => string | null,
+): string {
+	const phaseLabels: Record<'thinking' | 'tool_call' | 'responding', string> = {
+		thinking: '🤔 思考中',
+		tool_call: '🔧 执行工具',
+		responding: '💬 回复中',
+	};
+
+	if (snapshots.length === 0) {
+		return `当前没有正在运行的任务。\n\n> 定时任务与 Automation 未受影响，仍在正常运行。`;
+	}
+
+	const blocks = snapshots.map((snapshot) => {
+		const projectName = projectNameForWorkspace(snapshot.workspace) || '当前项目';
+		const lines = [
+			`**项目**：${projectName}`,
+			`**运行时长**：${formatElapsed(snapshot.runningTime)}`,
+		];
+		if (snapshot.promptPreview) {
+			lines.push(`**任务**：${snapshot.promptPreview}`);
+		}
+		if (snapshot.lastProgress) {
+			lines.push(`**最后状态**：${phaseLabels[snapshot.lastProgress.phase] ?? snapshot.lastProgress.phase}`);
+			const snippet = snapshot.lastProgress.snippet.trim();
+			if (snippet && snippet !== '...') {
+				lines.push(`**进行中**：\n\`\`\`\n${snippet.slice(0, 300)}\n\`\`\``);
+			}
+		} else if (snapshot.lastTool) {
+			lines.push(`**最近工具**：${snapshot.lastTool}`);
+		}
+		return lines.join('\n');
+	});
+
+	const header =
+		snapshots.length === 1
+			? `🛑 **任务已结束**\n\n**结束原因**：${triggerReason}`
+			: `🛑 **已结束 ${snapshots.length} 个任务**\n\n**结束原因**：${triggerReason}`;
+
+	return `${header}\n\n${blocks.join('\n\n---\n\n')}\n\n> 定时任务与 Automation 未受影响，仍在正常运行。`;
+}
 
 function formatElapsed(seconds: number): string {
 	if (seconds < 60) return `${seconds}秒`;
@@ -199,7 +243,7 @@ export class CommandHandler {
 			"- `/新对话` `/new` — 重置当前会话",
 			"- `/新对话 --all` — 批量重置所有项目的会话",
 			"- `/终止 [项目名]` `/stop` — 终止正在执行的任务",
-			"- `/终止 --all` — 批量终止所有运行中的任务",
+			"- `/终止 --all` — 批量终止所有运行中的交互任务",
 			"",
 			"**热点 / 新闻 / 天气**",
 			"- `/新闻` `/news` — **立即推送**今日热点（直接发 `/新闻`）；定时例：`/新闻 每天9点 推送10条`",
@@ -226,6 +270,10 @@ export class CommandHandler {
 		"- `/整理记忆` `/reindex` — 重建记忆索引",
 		"",
 	];
+
+	if (this.ctx.platform === 'wecom') {
+		helpText.splice(7, 0, "- 发送「**结束**」— 终止当前会话任务并返回结束原因（不影响定时任务）");
+	}
 
 	// 文件操作（所有平台支持）
 	helpText.push(
@@ -445,8 +493,10 @@ export class CommandHandler {
 	// /终止 - 终止任务
 	// ──────────────────────────────────────────────────
 
-	async handleStop(projectHint?: string): Promise<void> {
-		const { projectsConfig, busySessions, sessionsStore, agentExecutor } = this.ctx;
+	async handleStop(projectHint?: string, opts?: { reason?: string; chatId?: string }): Promise<void> {
+		const { projectsConfig, busySessions, agentExecutor } = this.ctx;
+		const triggerReason = opts?.reason ?? '用户手动终止';
+		const interactiveFilter = { source: 'interactive' as const, chatId: opts?.chatId };
 
 		const projectNameForWorkspace = (wsPath: string): string | null => {
 			for (const [name, info] of Object.entries(projectsConfig.projects) as [string, any][]) {
@@ -455,48 +505,17 @@ export class CommandHandler {
 			return null;
 		};
 
-		/** lockKey 为 ws:path 或 session:sessionId，需反查项目名用于 /stop 列表与提示 */
-		const getProjectNameByLockKey = (lockKey: string): string | null => {
-			if (lockKey.startsWith("ws:")) {
-				return projectNameForWorkspace(lockKey.replace(/^ws:/, ""));
-			}
-			if (lockKey.startsWith("session:")) {
-				const sessionId = lockKey.slice("session:".length);
-				for (const [workspace, wsData] of Array.from(sessionsStore.entries()) as [string, any][]) {
-					if (wsData?.active === sessionId) {
-						return projectNameForWorkspace(workspace);
-					}
-					if (Array.isArray(wsData?.history) && wsData.history.some((h: { id?: string }) => h?.id === sessionId)) {
-						return projectNameForWorkspace(workspace);
-					}
-				}
-			}
-			return null;
-		};
-
-		// 批量终止所有任务
+		// 批量终止所有交互任务（不影响定时/automation）
 		if (projectHint?.trim() === '--all') {
-			const activeList = agentExecutor ? agentExecutor.getActiveAgents() : [];
+			const activeList = agentExecutor ? agentExecutor.getActiveAgents(interactiveFilter) : [];
 			if (activeList.length === 0) {
-				await this.adapter.reply("当前没有正在运行的任务。");
+				await this.adapter.reply(formatStopReply([], triggerReason, projectNameForWorkspace));
 				return;
 			}
-			
-			const killedTasks: string[] = [];
-			if (agentExecutor) {
-				for (const agent of activeList) {
-					const projectName = projectNameForWorkspace(agent.workspace) || "未知项目";
-					killedTasks.push(`✅ **${projectName}**: 已终止 (PID: ${agent.pid}, 运行 ${agent.runningTime}s)`);
-					console.log(`[指令] 批量终止 agent pid=${agent.pid} project=${projectName}`);
-				}
-				agentExecutor.killAll();
-				busySessions.clear();
-			}
-			
-			await this.adapter.reply(
-				`🛑 **批量终止完成**\n\n${killedTasks.join('\n')}\n\n` +
-				`共终止 ${killedTasks.length} 个任务。`
-			);
+
+			const snapshots = agentExecutor ? agentExecutor.killAllInteractive() : [];
+			busySessions.clear();
+			await this.adapter.reply(formatStopReply(snapshots, triggerReason, projectNameForWorkspace));
 			return;
 		}
 
@@ -507,50 +526,43 @@ export class CommandHandler {
 				return;
 			}
 			const wsPath = projectsConfig.projects[projectHint].path;
-			
+
 			if (agentExecutor) {
-				const killed = agentExecutor.killAgent(wsPath);
-				if (killed) {
+				const snapshot = agentExecutor.killAgent(wsPath);
+				if (snapshot) {
 					busySessions.clear();
-					await this.adapter.reply(`✅ 已终止项目 **${projectHint}** 的任务。\n\n发送新消息将继续在当前会话中对话。`);
+					await this.adapter.reply(formatStopReply([snapshot], triggerReason, projectNameForWorkspace));
 				} else {
-					await this.adapter.reply(`项目 **${projectHint}** 没有正在运行的任务。`);
+					await this.adapter.reply(`项目 **${projectHint}** 没有正在运行的任务。\n\n> 定时任务与 Automation 未受影响。`);
 				}
 			}
 			return;
 		}
 
-		// 获取活跃任务列表
-		const activeList = agentExecutor ? agentExecutor.getActiveAgents() : [];
-		
+		const activeList = agentExecutor ? agentExecutor.getActiveAgents(interactiveFilter) : [];
+
 		if (activeList.length === 0) {
-			await this.adapter.reply("当前没有正在运行的任务。");
+			await this.adapter.reply(formatStopReply([], triggerReason, projectNameForWorkspace));
 			return;
 		}
 
-		if (activeList.length === 1) {
-			const agent = activeList[0]!;
-			const projectName = agentExecutor 
-				? projectNameForWorkspace(agent.workspace) || "当前项目"
-				: "当前项目";
-			
-			if (agentExecutor) {
-				agentExecutor.killAgent(agent.workspace);
-				busySessions.clear();
-			}
-			console.log(`[指令] 终止 agent pid=${agent.pid}`);
-			await this.adapter.reply(`✅ 已终止 **${projectName}** 的任务。`);
+		if (activeList.length === 1 || opts?.chatId) {
+			const snapshots = agentExecutor
+				? agentExecutor.killInteractiveAgents({ chatId: opts?.chatId })
+				: [];
+			busySessions.clear();
+			await this.adapter.reply(formatStopReply(snapshots, triggerReason, projectNameForWorkspace));
 			return;
 		}
 
 		const tasks = activeList.map((agent, i) => {
 			const projectName = projectNameForWorkspace(agent.workspace) || "未知项目";
-			const timeHint = `运行 ${agent.runningTime}s`;
+			const timeHint = `运行 ${formatElapsed(agent.runningTime)}`;
 			return `${i + 1}. **${projectName}**\n   PID: ${agent.pid} ${timeHint}`;
 		});
 
 		await this.adapter.reply(
-			`**当前运行中（${activeList.length} 个）**\n\n${tasks.join("\n\n")}\n\n> 发送 \`/终止 项目名\` 可终止指定项目的任务\n> 发送 \`/终止 --all\` 可终止所有任务`
+			`**当前运行中（${activeList.length} 个）**\n\n${tasks.join("\n\n")}\n\n> 发送 \`/终止 项目名\` 可终止指定项目的任务\n> 发送 \`/终止 --all\` 可终止所有交互任务\n> 发送「结束」可终止当前会话任务`
 		);
 	}
 
@@ -1581,7 +1593,16 @@ export class CommandHandler {
 		const stopMatch = text.trim().match(/^\/(stop|终止|停止)(?:\s+(.+))?$/i);
 		if (stopMatch) {
 			const projectHint = stopMatch[2]?.trim();
-			await this.handleStop(projectHint);
+			await this.handleStop(projectHint, { chatId: options?.chatId });
+			return true;
+		}
+
+		// 企业微信：自然语言终止当前会话任务
+		if (this.ctx.platform === 'wecom' && /^结束$/i.test(text.trim())) {
+			await this.handleStop(undefined, {
+				reason: '用户发送「结束」',
+				chatId: options?.chatId,
+			});
 			return true;
 		}
 

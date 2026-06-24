@@ -30,11 +30,29 @@ const PROGRESS_INTERVAL = 2000; // 2 秒
 // 全局状态
 const activeAgents = new Map<string, AgentProcessInfo>();
 
+export type AgentTaskSource = 'interactive' | 'scheduled';
+
+export interface AgentStopSnapshot {
+	workspace: string;
+	pid: number;
+	runningTime: number;
+	source: AgentTaskSource;
+	chatId?: string;
+	promptPreview?: string;
+	lastProgress?: AgentProgress;
+	lastTool?: string;
+}
+
 interface AgentProcessInfo {
 	pid: number;
 	kill: () => void;
 	workspace: string;
 	startTime: number;
+	source: AgentTaskSource;
+	chatId?: string;
+	promptPreview?: string;
+	lastProgress?: AgentProgress;
+	lastTool?: string;
 	abort: () => void; // 立即中止并 reject Promise
 }
 
@@ -57,6 +75,9 @@ export interface AgentExecutorOptions {
 	sessionId?: string;
 	platform?: 'feishu' | 'dingtalk' | 'wecom' | 'wechat' | 'telegram';
 	webhook?: string;
+	/** interactive=用户消息触发；scheduled=定时任务/心跳/automation，不会被「结束」终止 */
+	source?: AgentTaskSource;
+	chatId?: string;
 	
 	// 回调函数
 	onProgress?: (progress: AgentProgress) => void;
@@ -257,8 +278,8 @@ export class AgentExecutor {
 				if (feedbackGateKeepaliveTimer) clearTimeout(feedbackGateKeepaliveTimer);
 			};
 			
-			// 注册进程
-			activeAgents.set(lockKey, {
+			const taskSource: AgentTaskSource = options.source ?? 'interactive';
+			const agentInfo: AgentProcessInfo = {
 				pid: child.pid,
 				kill: () => { 
 					try { 
@@ -290,7 +311,17 @@ export class AgentExecutor {
 				},
 				workspace: workspaceAbs,
 				startTime,
-			});
+				source: taskSource,
+				chatId: options.chatId,
+				promptPreview: options.prompt.slice(0, 120),
+				lastProgress: undefined,
+				lastTool: undefined,
+			};
+			activeAgents.set(lockKey, agentInfo);
+
+			const recordProgress = (progress: AgentProgress) => {
+				agentInfo.lastProgress = progress;
+			};
 			
 			// 超时保护
 			timeoutTimer = setTimeout(() => {
@@ -341,11 +372,13 @@ export class AgentExecutor {
 			// 进度更新（feedback gate 激活时暂停）
 			if (options.onProgress && now - lastProgressTime >= PROGRESS_INTERVAL && !feedbackGateActive) {
 				lastProgressTime = now;
-				options.onProgress({
+				const progress = {
 					elapsed: Math.round((now - startTime) / 1000),
 					phase,
 					snippet: getSnippet(),
-				});
+				};
+				recordProgress(progress);
+				options.onProgress(progress);
 			}
 		}, 1000);
 			
@@ -398,6 +431,7 @@ export class AgentExecutor {
 						if (ev.tool_call && ev.subtype === 'started') {
 							const desc = describeToolCall(ev.tool_call);
 							toolSummary.push(desc);
+							agentInfo.lastTool = desc;
 						}
 						if (ev.tool_call) {
 							const toolName = Object.keys(ev.tool_call)[0] || '';
@@ -431,11 +465,13 @@ export class AgentExecutor {
 					if (phase !== prevPhase && options.onProgress && !feedbackGateActive) {
 						const now = Date.now();
 						lastProgressTime = now;
-						options.onProgress({
+						const progress = {
 							elapsed: Math.round((now - startTime) / 1000),
 							phase,
 							snippet: getSnippet(),
-						});
+						};
+						recordProgress(progress);
+						options.onProgress(progress);
 					}
 				} catch (err) {
 					// 忽略非 JSON 行
@@ -673,33 +709,76 @@ export class AgentExecutor {
 		}, 30000); // 每 30 秒检查一次（更快发现僵尸进程）
 	}
 	
-	// 获取当前活跃任务
-	getActiveAgents() {
-		return Array.from(activeAgents.entries()).map(([key, agent]) => ({
-			key,
-			pid: agent.pid,
+	private toSnapshot(agent: AgentProcessInfo): AgentStopSnapshot {
+		return {
 			workspace: agent.workspace,
+			pid: agent.pid,
 			runningTime: Math.round((Date.now() - agent.startTime) / 1000),
-		}));
+			source: agent.source,
+			chatId: agent.chatId,
+			promptPreview: agent.promptPreview,
+			lastProgress: agent.lastProgress,
+			lastTool: agent.lastTool,
+		};
+	}
+
+	// 获取当前活跃任务（默认仅用户交互任务）
+	getActiveAgents(filter?: { source?: AgentTaskSource; chatId?: string }) {
+		return Array.from(activeAgents.entries())
+			.filter(([, agent]) => {
+				if (filter?.source && agent.source !== filter.source) return false;
+				if (filter?.chatId && agent.chatId !== filter.chatId) return false;
+				return true;
+			})
+			.map(([key, agent]) => ({
+				key,
+				pid: agent.pid,
+				workspace: agent.workspace,
+				runningTime: Math.round((Date.now() - agent.startTime) / 1000),
+				source: agent.source,
+				chatId: agent.chatId,
+			}));
 	}
 	
-	// 手动终止任务（按 workspace）
-	killAgent(workspace: string): boolean {
+	// 手动终止任务（按 workspace，仅 interactive）
+	killAgent(workspace: string): AgentStopSnapshot | null {
+		const workspaceAbs = pathResolve(workspace);
 		for (const [key, agent] of activeAgents.entries()) {
-			if (agent.workspace === workspace) {
+			if (agent.workspace === workspaceAbs && agent.source === 'interactive') {
 				console.log(`[AgentExecutor] 手动终止任务: ${key}`);
-				agent.abort(); // 使用 abort 立即中止并 reject Promise
-				return true;
+				const snapshot = this.toSnapshot(agent);
+				agent.abort();
+				return snapshot;
 			}
 		}
-		return false;
+		return null;
+	}
+
+	// 终止交互任务（不影响定时/automation）
+	killInteractiveAgents(filter?: { chatId?: string; workspace?: string }): AgentStopSnapshot[] {
+		const workspaceAbs = filter?.workspace ? pathResolve(filter.workspace) : undefined;
+		const killed: AgentStopSnapshot[] = [];
+		for (const [key, agent] of activeAgents.entries()) {
+			if (agent.source !== 'interactive') continue;
+			if (filter?.chatId && agent.chatId !== filter.chatId) continue;
+			if (workspaceAbs && agent.workspace !== workspaceAbs) continue;
+			console.log(`[AgentExecutor] 终止交互任务: ${key}`);
+			killed.push(this.toSnapshot(agent));
+			agent.abort();
+		}
+		return killed;
 	}
 	
-	// 终止所有任务
+	// 终止所有交互任务
+	killAllInteractive(): AgentStopSnapshot[] {
+		return this.killInteractiveAgents();
+	}
+
+	// 进程退出时终止全部任务（含定时/automation）
 	killAll() {
 		console.log(`[AgentExecutor] 终止所有任务 (${activeAgents.size}个)`);
-		for (const [key, agent] of activeAgents.entries()) {
-			agent.abort(); // 使用 abort 立即中止并 reject Promise
+		for (const [, agent] of activeAgents.entries()) {
+			agent.abort();
 		}
 	}
 }

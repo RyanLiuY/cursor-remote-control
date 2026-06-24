@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@wecom/aibot-node-sdk": "^1.0.0",
     "@vitalets/google-translate-api": "^9.2.1",
     "cron-chinese": "^1.2.0",
     "fast-xml-parser": "^5.5.5",

@@ -206,8 +206,32 @@ bash service.sh uninstall  # 卸载自启动
 
 **独立配置**：
 - `wecom/.env` - 企业微信凭据
-- `../cron-jobs-wecom.json` - 企业微信定时任务（项目根目录）
+- `../cron-jobs-wecom.json` - 企业微信本地定时任务（项目根目录，仅邮件晨报）
 - `../cron-jobs-wechat.json` - 微信定时任务（项目根目录）
+
+### 定时任务 vs Cloud Automation
+
+| 任务 | 调度方式 | 配置位置 | 推送 |
+|------|----------|----------|------|
+| 每日邮件晨报 9:05 | 本地 Scheduler（cron） | `cron-jobs-wecom.json` | Agent 输出 → webhook |
+| 每日时间管理 8:30 | **Cursor Cloud Automation** | `.cursor/automations/daily-time-master.json` | `scripts/push-wecom-markdown.ts` |
+| 每周工作周报 周五 15:00 | **Cursor Cloud Automation** | `.cursor/automations/weekly-report.json` | `scripts/push-wecom-markdown.ts` |
+
+Cloud Automation 需在 Cursor **Automations** 界面保存并启用；Prompt 见 `config/automation-prompts/`。
+
+**Cloud Agent 密钥**（Automation 运行环境）需配置：
+
+| 变量 | 说明 |
+|------|------|
+| `WECOM_BOT_ID` | 企业微信机器人 BotID |
+| `WECOM_BOT_SECRET` | 机器人 Secret |
+| `WECOM_CHAT_ID` | 接收 chatid，默认 `LiuHaoCheng` |
+
+本地测试推送：
+
+```bash
+bun run scripts/push-wecom-markdown.ts --title "测试" --text "Hello"
+```
 
 ---
 

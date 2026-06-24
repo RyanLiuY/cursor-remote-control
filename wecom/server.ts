@@ -249,7 +249,7 @@ const heartbeat = new HeartbeatRunner({
 	shouldRun: createSessionActivityGate(memoryWorkspace),
 	onExecute: async (prompt: string) => {
 		memory?.appendSessionLog(memoryWorkspace, "user", "[心跳检查] " + prompt.slice(0, 200), config.CURSOR_MODEL);
-		const { result, quotaWarning } = await runAgent(memoryWorkspace, prompt);
+		const { result, quotaWarning } = await runAgent(memoryWorkspace, prompt, undefined, { source: 'scheduled' });
 		const finalResult = quotaWarning ? `${quotaWarning}\n\n---\n\n${result}` : result;
 		memory?.appendSessionLog(memoryWorkspace, "assistant", finalResult.slice(0, 3000), config.CURSOR_MODEL);
 		return finalResult;
@@ -301,6 +301,8 @@ async function runAgent(
 	context?: {
 		platform?: string;
 		webhook?: string;
+		source?: 'interactive' | 'scheduled';
+		chatId?: string;
 		onSessionId?: (sessionId: string) => void;
 		onProgress?: (progress: AgentProgress) => void;
 		onStart?: () => void;
@@ -327,6 +329,8 @@ async function runAgent(
 				sessionId: agentId,
 				platform: context?.platform as 'wecom' | undefined,
 				webhook: context?.webhook,
+				source: context?.source ?? 'interactive',
+				chatId: context?.chatId,
 				onProgress: context?.onProgress,
 				onStart: context?.onStart,
 				apiKey: config.CURSOR_API_KEY,
@@ -946,6 +950,8 @@ wsClient.on('message.text', async (frame: WsFrame) => {
 			const { result, quotaWarning } = await runAgent(workspace, message, session.agentId, {
 				platform: 'wecom',
 				webhook: chatid,
+				source: 'interactive',
+				chatId: chatid,
 				onSessionId: (sid) => {
 					session.agentId = sid;
 					setActiveSession(workspace, sid, message.slice(0, 40));
@@ -991,9 +997,12 @@ wsClient.on('message.text', async (frame: WsFrame) => {
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
 			
-			// 手动终止的任务不需要发送错误消息（用户已经收到"已终止"的回复）
+			// 手动终止的任务不需要发送错误消息（用户已经收到结束回复）
 			if (msg === 'MANUALLY_STOPPED') {
 				console.log(`[手动终止] workspace=${workspace} lockKey=${lockKey}`);
+				await wsClient.replyStream(frame, streamId, '🛑 **任务已结束**', true).catch((err) => {
+					console.error('[手动终止] 关闭流式消息失败:', err);
+				});
 			} else {
 				console.error(`[失败] ${msg.slice(0, 200)}`);
 				
@@ -1054,7 +1063,7 @@ const scheduler = new Scheduler({
 						const workspace = job.workspace || defaultWorkspace;
 						const model = job.model || config.CURSOR_MODEL || getDefaultModel();
 						
-						const { result } = await runAgent(workspace, job.task.prompt, undefined);
+						const { result } = await runAgent(workspace, job.task.prompt, undefined, { source: 'scheduled' });
 						
 						return { status: 'ok' as const, result };
 					} catch (err) {
@@ -1115,7 +1124,7 @@ const scheduler = new Scheduler({
 				const workspace = job.workspace || defaultWorkspace;
 				const model = job.model || config.CURSOR_MODEL || getDefaultModel();
 				
-				const { result } = await runAgent(workspace, parsed.prompt, undefined);
+				const { result } = await runAgent(workspace, parsed.prompt, undefined, { source: 'scheduled' });
 				
 				return { status: 'ok' as const, result };
 			} catch (err) {

@@ -19,6 +19,36 @@
       "state": {}
     },
     {
+      "id": "example-daily-email-digest",
+      "name": "每日邮件晨报 9:05（Agent 示例）",
+      "enabled": false,
+      "deleteAfterRun": false,
+      "schedule": {
+        "kind": "cron",
+        "expr": "5 9 * * *",
+        "tz": "Asia/Shanghai",
+        "comment": "每天上午 9:05（Asia/Shanghai）"
+      },
+      "message": "daily-email-digest",
+      "task": {
+        "type": "agent-prompt",
+        "prompt": "先 Read 文件 config/automation-prompts/daily-email-digest.txt，严格按其中步骤执行并输出企业微信 Markdown 晨报。",
+        "options": { "timeoutMs": 600000 }
+      },
+      "retryPolicy": {
+        "intervalMs": 900000,
+        "untilSuccess": true,
+        "maxRetriesPerDay": 96,
+        "tz": "Asia/Shanghai"
+      },
+      "workspace": "/path/to/your/workspace",
+      "platform": "wecom",
+      "webhook": "your_chatid_here",
+      "createdAt": "2026-06-24T08:00:00.000Z",
+      "updatedAt": "2026-06-24T08:00:00.000Z",
+      "state": {}
+    },
+    {
       "id": "example-weekday-reminder",
       "name": "工作日提醒示例",
       "enabled": false,
@@ -71,6 +101,7 @@
     }
   ],
   "comments": {
+    "automation_vs_cron": "每日时间管理(8:30)与每周周报(周五15:00)请用 Cursor Cloud Automation，见 .cursor/automations/ 与 config/automation-prompts/；本文件仅保留需本地 Scheduler 的任务（如邮件晨报）",
     "version": "文件格式版本，当前为 1",
     "jobs": "任务数组",
     "schedule.kind": "调度类型：cron(cron表达式) | every(固定间隔) | at(指定时间)",
@@ -80,6 +111,9 @@
     "platform": "平台标识：wecom | feishu | dingtalk",
     "webhook": "企业微信的 chatid，用于推送（可选，默认推送到最近活跃会话）",
     "deleteAfterRun": "执行一次后是否自动删除",
-    "enabled": "是否启用，false 表示暂停"
+    "enabled": "是否启用，false 表示暂停",
+    "retryPolicy.intervalMs": "失败后重试间隔（毫秒），配合 untilSuccess 使用",
+    "retryPolicy.untilSuccess": "true 时当日失败按 intervalMs 重试直到成功",
+    "retryPolicy.maxRetriesPerDay": "单日最大重试次数，默认 96"
   }
 }
