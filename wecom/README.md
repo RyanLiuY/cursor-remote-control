@@ -217,7 +217,7 @@ bash service.sh uninstall  # 卸载自启动
 | 每日时间管理 8:30 | **Cursor Cloud Automation** | `.cursor/automations/daily-time-master.json` | `scripts/push-wecom-markdown.ts` |
 | 每周工作周报 周五 15:00 | **Cursor Cloud Automation** | `.cursor/automations/weekly-report.json` | `scripts/push-wecom-markdown.ts` |
 
-Cloud Automation 需在 Cursor **Automations** 界面保存并启用；Prompt 见 `config/automation-prompts/`。
+Cloud Automation 需在 Cursor **Automations** 界面保存并启用；仓库为 **`RyanLiuY/cursor-remote-control`**（`main`），模板见 `.cursor/automations/`；Prompt 见 `config/automation-prompts/`。
 
 **Cloud Agent 密钥**（Automation 运行环境）需配置：
 
