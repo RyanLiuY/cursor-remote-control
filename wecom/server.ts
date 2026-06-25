@@ -18,8 +18,15 @@ import { Scheduler, type CronJob } from '../shared/scheduler.js';
 import {
 	clearWecomPushServerPid,
 	drainWecomPushQueue,
+	enqueueWecomPush,
 	writeWecomPushServerPid,
 } from '../shared/wecom-push-queue.js';
+import {
+	isWecomConnectionPushError,
+	scheduleWecomServiceRestart,
+} from '../shared/wecom-service-restart.js';
+import { ensureWecomPushReady } from '../shared/wecom-push-guard.js';
+import { writeWecomWsStatus } from '../shared/wecom-ws-status.js';
 import { MemoryManager } from '../shared/memory.js';
 import { HeartbeatRunner, getHeartbeatGlobalConfig, createSessionActivityGate, isHeartbeatEnabled } from '../shared/heartbeat.js';
 import { FeilianController, type OperationResult } from '../shared/feilian-control.js';
@@ -544,12 +551,19 @@ const wsClient = new AiBot.WSClient({
 // ── 事件监听 ─────────────────────────────────────
 wsClient.on('authenticated', () => {
 	console.log('🔐 [企业微信] WebSocket 认证成功');
+	writeWecomWsStatus(ROOT, { connected: true, atMs: Date.now(), pid: process.pid });
 });
 
 wsClient.on('disconnected', async (reason) => {
-	console.warn(`⚠️  [企业微信] 连接断开: ${reason || '未知原因'}`);
-	// SDK 会自动重连，无需手动干预
-	console.log('[企业微信] SDK 将自动重连...');
+	const reasonStr = typeof reason === 'string' ? reason : String(reason ?? '未知原因');
+	console.warn(`⚠️  [企业微信] 连接断开: ${reasonStr}`);
+	writeWecomWsStatus(ROOT, {
+		connected: false,
+		atMs: Date.now(),
+		pid: process.pid,
+		reason: reasonStr,
+	});
+	console.log('[企业微信] SDK 将自动重连…');
 });
 
 // 进入会话事件（发送欢迎语）
@@ -1033,6 +1047,12 @@ const cronStorePath = resolve(ROOT, 'cron-jobs-wecom.json');
 const scheduler = new Scheduler({
 	storePath: cronStorePath,
 	defaultWorkspace,
+	beforeExecute: async (job: CronJob) => {
+		if (job.platform && job.platform !== 'wecom') return;
+		await ensureWecomPushReady(ROOT, config as Record<string, string>, {
+			log: (msg) => console.log(`[定时] ${msg}`),
+		});
+	},
 	onExecute: async (job: CronJob) => {
 		// 新格式：优先使用 task 字段
 		if (job.task) {
@@ -1172,44 +1192,51 @@ const scheduler = new Scheduler({
 		}
 		
 		if (!chatid) {
-			console.warn("[定时] 无活跃会话，跳过推送");
-			return;
+			throw new Error('无活跃会话或 webhook，无法推送');
 		}
-		
-		try {
-			// 检查是否为新闻推送任务（分批消息）
-			let chunks: string[];
-			try {
-				const parsed = JSON.parse(result) as { chunks?: string[] };
-				chunks = parsed.chunks || [result];
-			} catch {
-				chunks = [result];
-			}
 
-			// 发送消息（支持分批）
-		for (let i = 0; i < chunks.length; i++) {
-			const chunk = chunks[i];
-			if (!chunk) continue;
-			
-			const title = chunks.length > 1 
-				? `⏰ **${job.name}** (${i + 1}/${chunks.length})`
-				: `⏰ **定时任务：${job.name}**`;
-			
-			await wsClient.sendMessage(chatid, {
-				msgtype: 'markdown',
-				markdown: {
-					content: `${title}\n\n${chunk.slice(0, 3000)}`,
-				},
-			});
-				
-				// 分批发送时添加短暂延迟，避免消息发送过快
+		// 检查是否为新闻推送任务（分批消息）
+		let chunks: string[];
+		try {
+			const parsed = JSON.parse(result) as { chunks?: string[] };
+			chunks = parsed.chunks || [result];
+		} catch {
+			chunks = [result];
+		}
+
+		// 发送消息（支持分批）
+		try {
+			for (let i = 0; i < chunks.length; i++) {
+				const chunk = chunks[i];
+				if (!chunk) continue;
+
+				const title = chunks.length > 1
+					? `⏰ **${job.name}** (${i + 1}/${chunks.length})`
+					: `⏰ **定时任务：${job.name}**`;
+
+				await wsClient.sendMessage(chatid, {
+					msgtype: 'markdown',
+					markdown: {
+						content: `${title}\n\n${chunk.slice(0, 3000)}`,
+					},
+				});
+
 				if (i < chunks.length - 1) {
 					await new Promise(r => setTimeout(r, 500));
 				}
 			}
 			console.log(`[定时] 任务结果已推送到 chatid=${chatid.slice(0, 8)}... (${chunks.length} 条消息)`);
 		} catch (err) {
-			console.error('[定时] 推送失败:', err);
+			const errMsg = err instanceof Error ? err.message : String(err);
+			enqueueWecomPush(ROOT, {
+				chatid,
+				title: `定时任务：${job.name}`,
+				body: result.trim(),
+			});
+			if (isWecomConnectionPushError(err)) {
+				scheduleWecomServiceRestart(ROOT, `定时任务推送失败: ${errMsg}`);
+			}
+			throw err;
 		}
 	},
 	log: (msg: string) => console.log(`[调度] ${msg}`),
@@ -1264,7 +1291,13 @@ while (startRetries > 0) {
 				.then((n) => {
 					if (n > 0) console.log(`[push-queue] 已发送 ${n} 条队列消息`);
 				})
-				.catch((err) => console.error('[push-queue] 发送失败:', err));
+				.catch((err) => {
+					const errMsg = err instanceof Error ? err.message : String(err);
+					console.error('[push-queue] 发送失败:', errMsg);
+					if (isWecomConnectionPushError(err)) {
+						scheduleWecomServiceRestart(ROOT, `推送队列发送失败: ${errMsg}`);
+					}
+				});
 		}, 2000);
 		break;
 	} catch (err) {

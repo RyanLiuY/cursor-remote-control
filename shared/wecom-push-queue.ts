@@ -72,11 +72,12 @@ export async function drainWecomPushQueue(
 	const raw = readFileSync(queuePath, 'utf-8');
 	if (!raw.trim()) return 0;
 
+	const lines = raw.split('\n').filter((line) => line.trim());
 	writeFileSync(queuePath, '', 'utf-8');
 
 	let sent = 0;
-	for (const line of raw.split('\n')) {
-		if (!line.trim()) continue;
+	for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+		const line = lines[lineIdx]!;
 		try {
 			const item = JSON.parse(line) as WecomPushItem;
 			const chunks = chunkWecomMarkdown(item.body.trim());
@@ -92,6 +93,10 @@ export async function drainWecomPushQueue(
 			sent++;
 		} catch (err) {
 			console.error('[wecom-push-queue] 处理队列项失败:', err instanceof Error ? err.message : err);
+			for (let j = lineIdx; j < lines.length; j++) {
+				appendFileSync(queuePath, `${lines[j]}\n`, 'utf-8');
+			}
+			throw err;
 		}
 	}
 	return sent;

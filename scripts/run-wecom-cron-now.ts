@@ -5,9 +5,14 @@
 import AiBot from '@wecom/aibot-node-sdk';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { Scheduler, type CronJob, type CronStoreFile } from '../shared/scheduler.ts';
+import { type CronJob, type CronStoreFile } from '../shared/scheduler.ts';
 import { AgentExecutor } from '../shared/agent-executor.ts';
 import { getDefaultModel } from '../shared/models-config.js';
+import {
+	enqueueWecomPush,
+	isWecomPushServerRunning,
+} from '../shared/wecom-push-queue.ts';
+import { ensureWecomPushReady } from '../shared/wecom-push-guard.ts';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const ENV_PATH = resolve(ROOT, 'wecom/.env');
@@ -38,18 +43,12 @@ function loadJob(prefix: string): CronJob {
 	return job;
 }
 
-async function main() {
-	if (!existsSync(ENV_PATH)) throw new Error(`缺少 ${ENV_PATH}`);
-	if (!existsSync(CRON_PATH)) throw new Error(`缺少 ${CRON_PATH}`);
-
-	const env = loadEnv();
-	const job = loadJob(jobPrefix);
-	const chatid = chatidOverride || 'LiuHaoCheng';
-
-	if (job.task?.type !== 'agent-prompt') {
-		throw new Error(`任务 ${job.id} 不是 agent-prompt 类型`);
-	}
-
+async function pushViaWebSocket(
+	env: Record<string, string>,
+	chatid: string,
+	title: string,
+	body: string,
+): Promise<void> {
 	const wsClient = new AiBot.WSClient({
 		botId: env.WECOM_BOT_ID!,
 		secret: env.WECOM_BOT_SECRET!,
@@ -68,10 +67,45 @@ async function main() {
 		wsClient.connect();
 	});
 
-	await wsClient.sendMessage(chatid, {
-		msgtype: 'markdown',
-		markdown: { content: `▶ **手动执行中**\n\n正在运行: **${job.name}**…` },
-	});
+	try {
+		await wsClient.sendMessage(chatid, {
+			msgtype: 'markdown',
+			markdown: { content: `**${title}**\n\n${body.slice(0, 3000)}` },
+		});
+	} finally {
+		wsClient.disconnect();
+	}
+}
+
+async function deliver(
+	chatid: string,
+	title: string,
+	body: string,
+	env: Record<string, string>,
+): Promise<void> {
+	if (isWecomPushServerRunning(ROOT)) {
+		enqueueWecomPush(ROOT, { chatid, title, body });
+		console.log(`[run-cron] 已写入推送队列 → ${chatid}（由 wecom/server 发送）`);
+		return;
+	}
+	await pushViaWebSocket(env, chatid, title, body);
+}
+
+async function main() {
+	if (!existsSync(ENV_PATH)) throw new Error(`缺少 ${ENV_PATH}`);
+	if (!existsSync(CRON_PATH)) throw new Error(`缺少 ${CRON_PATH}`);
+
+	const env = loadEnv();
+	const job = loadJob(jobPrefix);
+	const chatid = chatidOverride || job.webhook || 'LiuHaoCheng';
+
+	if (job.task?.type !== 'agent-prompt') {
+		throw new Error(`任务 ${job.id} 不是 agent-prompt 类型`);
+	}
+
+	await ensureWecomPushReady(ROOT, env, { log: (m) => console.log(`[run-cron] ${m}`) });
+
+	await deliver(chatid, '手动执行中', `正在运行: **${job.name}**…`, env);
 
 	const agentExecutor = new AgentExecutor({ timeout: job.task.options?.timeoutMs ?? 600_000 });
 	const workspace = job.workspace || ROOT;
@@ -88,29 +122,8 @@ async function main() {
 		apiKey: env.CURSOR_API_KEY || undefined,
 	});
 
-	const chunks: string[] = [];
-	if (result.length <= 3000) {
-		chunks.push(result);
-	} else {
-		for (let i = 0; i < result.length; i += 2800) {
-			chunks.push(result.slice(i, i + 2800));
-		}
-	}
-
-	for (let i = 0; i < chunks.length; i++) {
-		const chunk = chunks[i]!;
-		const title =
-			chunks.length > 1
-				? `⏰ **${job.name}** (${i + 1}/${chunks.length})`
-				: `⏰ **定时任务：${job.name}**`;
-		await wsClient.sendMessage(chatid, {
-			msgtype: 'markdown',
-			markdown: { content: `${title}\n\n${chunk.slice(0, 3000)}` },
-		});
-		if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, 500));
-	}
-
-	console.log(`[run-cron] 完成，已推送 ${chunks.length} 条消息到 ${chatid}`);
+	await deliver(chatid, `定时任务：${job.name}`, result.trim(), env);
+	console.log(`[run-cron] 完成，已推送至 ${chatid}`);
 	process.exit(0);
 }
 

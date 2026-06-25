@@ -12,6 +12,7 @@
  *   echo "内容" | bun run scripts/push-wecom-markdown.ts --title "标题"
  *
  * 本地 wecom/server 运行时默认走推送队列，避免与长连接互踢。
+ * 推送前自动检查 WebSocket；失败最多 3 次，间隔 5 分钟。
  */
 import AiBot from '@wecom/aibot-node-sdk';
 import { readFileSync, existsSync } from 'node:fs';
@@ -20,6 +21,7 @@ import {
 	enqueueWecomPush,
 	isWecomPushServerRunning,
 } from '../shared/wecom-push-queue.ts';
+import { runWithWecomPushGuard } from '../shared/wecom-push-guard.ts';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const ENV_PATH = resolve(ROOT, 'wecom/.env');
@@ -96,6 +98,16 @@ async function pushViaWebSocket(chatid: string, title: string, body: string, env
 	console.log(`[push-wecom] WebSocket 已推送 ${chunks.length} 条消息到 ${chatid}`);
 }
 
+async function deliver(chatid: string, title: string, body: string, env: Record<string, string>, mode: 'queue' | 'direct') {
+	const useLocalQueue = mode === 'queue' || (env.WECOM_PUSH_DIRECT !== '1' && isWecomPushServerRunning(ROOT));
+	if (useLocalQueue && env.WECOM_PUSH_DIRECT !== '1') {
+		enqueueWecomPush(ROOT, { chatid, title, body: body.trim() });
+		console.log(`[push-wecom] 已写入本地推送队列 → ${chatid}（由 wecom/server 发送）`);
+		return;
+	}
+	await pushViaWebSocket(chatid, title, body, env);
+}
+
 async function main() {
 	const { title, file, text } = parseArgs(process.argv.slice(2));
 	const env = loadEnv();
@@ -108,14 +120,12 @@ async function main() {
 	}
 	if (!body.trim()) throw new Error('无推送内容，请使用 --file / --text 或 stdin');
 
-	const useLocalQueue = env.WECOM_PUSH_DIRECT !== '1' && isWecomPushServerRunning(ROOT);
-	if (useLocalQueue) {
-		enqueueWecomPush(ROOT, { chatid, title, body: body.trim() });
-		console.log(`[push-wecom] 已写入本地推送队列 → ${chatid}（由 wecom/server 发送，避免 WebSocket 互踢）`);
-		process.exit(0);
-	}
-
-	await pushViaWebSocket(chatid, title, body, env);
+	await runWithWecomPushGuard(
+		ROOT,
+		env,
+		(mode) => deliver(chatid, title, body, env, mode),
+		{ label: 'Markdown 推送' },
+	);
 	process.exit(0);
 }
 

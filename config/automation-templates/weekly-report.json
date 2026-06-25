@@ -1,0 +1,15 @@
+{
+  "name": "每周工作周报（周五 15:00）",
+  "description": "Cloud Automation：汇总当周日程/待办，按售前/项目/产品生成周报并推送到企微机器人。",
+  "workflow": {
+    "triggers": [{ "cron": { "cron": "0 15 * * 5" } }],
+    "actions": [],
+    "prompts": [
+      "You are a Cursor Cloud Automation scheduled job.\n\n0. **First**, run and wait for success: `bun run scripts/ensure-wecom-ws.ts` (WebSocket preflight; auto reconnect/retry up to 3 times, 5 min apart). Exit non-zero if it fails.\n1. Read and strictly follow `config/automation-prompts/weekly-report.txt` in this repository.\n2. Use wecom-cli to fetch last week + this week schedules and todos (Asia/Shanghai). Ensure wecom-cli is on PATH; use Cloud Agent secrets for auth if needed.\n3. Generate the weekly report in WeCom Markdown per that file (last week / this week, 售前/项目/产品 modules, strikethrough for completed last-week items).\n4. **Must push** to WeCom bot:\n   `bun run scripts/push-wecom-markdown.ts --title \"📊 工作周报 · YYYY-MM-DD\" --text \"<full markdown>\"`\n5. Exit non-zero if push fails. Do not only print to chat — delivery is via the push script.\n\nRequired env (Cloud Agent secrets or wecom/.env): WECOM_BOT_ID, WECOM_BOT_SECRET, WECOM_CHAT_ID (default LiuHaoCheng)."
+    ],
+    "model": "",
+    "gitConfig": { "repo": "RyanLiuY/cursor-remote-control", "branch": "main" },
+    "memoryEnabled": true,
+    "agentOptions": { "skipInstall": false }
+  }
+}

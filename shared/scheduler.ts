@@ -183,6 +183,8 @@ function computeNextRun(job: CronJob, now: number): number | undefined {
 interface SchedulerOpts {
 	storePath: string;
 	defaultWorkspace: string;
+	/** 任务执行前（如 WebSocket 就绪检查） */
+	beforeExecute?: (job: CronJob) => Promise<void>;
 	onExecute: (job: CronJob) => Promise<{ status: "ok" | "error"; result?: string; error?: string }>;
 	onDelivery?: (job: CronJob, result: string) => Promise<void>;
 	log?: (msg: string) => void;
@@ -363,6 +365,9 @@ export class Scheduler {
 		let error: string | undefined;
 
 		try {
+			if (this.opts.beforeExecute) {
+				await this.opts.beforeExecute(job);
+			}
 			const result = await this.opts.onExecute(job);
 			status = result.status;
 			error = result.error;
@@ -370,9 +375,13 @@ export class Scheduler {
 				job.state.consecutiveErrors = 0;
 				job.state.lastError = undefined;
 				if (result.result && this.opts.onDelivery) {
-					await this.opts.onDelivery(job, result.result).catch((e) =>
-						this.log(`投递失败 "${job.name}": ${e}`),
-					);
+					try {
+						await this.opts.onDelivery(job, result.result);
+					} catch (e) {
+						status = "error";
+						error = e instanceof Error ? e.message : String(e);
+						this.log(`投递失败 "${job.name}": ${error}`);
+					}
 				}
 			}
 		} catch (err) {

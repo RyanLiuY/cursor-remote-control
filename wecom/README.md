@@ -217,7 +217,15 @@ bash service.sh uninstall  # 卸载自启动
 | 每日时间管理 8:30 | **Cursor Cloud Automation** | `.cursor/automations/daily-time-master.json` | `scripts/push-wecom-markdown.ts` |
 | 每周工作周报 周五 15:00 | **Cursor Cloud Automation** | `.cursor/automations/weekly-report.json` | `scripts/push-wecom-markdown.ts` |
 
-Cloud Automation 需在 Cursor **Automations** 界面保存并启用；仓库为 **`RyanLiuY/cursor-remote-control`**（`main`），模板见 `.cursor/automations/`；Prompt 见 `config/automation-prompts/`。
+Cloud Automation 需在 Cursor **Automations** 界面保存并启用；仓库为 **`RyanLiuY/cursor-remote-control`**（`main`），模板见 `config/automation-templates/`（可导入 Cursor）；Prompt 见 `config/automation-prompts/`。
+
+**触发前 WebSocket 检查**（Automation 与本地定时任务共用）：
+
+```bash
+bun run scripts/ensure-wecom-ws.ts   # 失败自动重连/重启 wecom 服务，最多 3 次、间隔 5 分钟
+```
+
+本地邮件晨报（9:05）由 Scheduler 的 `beforeExecute` 自动调用上述逻辑；推送脚本 `push-wecom-markdown.ts` 同样内置 3×5min 重试。
 
 **Cloud Agent 密钥**（Automation 运行环境）需配置：
 

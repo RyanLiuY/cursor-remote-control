@@ -1,0 +1,15 @@
+{
+  "name": "陆家嘴财经早餐 · 分析师研判",
+  "description": "wind-breakfast 仓库：每天 08:30 抓取 Wind/华尔街见闻早餐，宏观分析 + A 股战术推荐，推送到企微。",
+  "note": "Automation 托管在 wind-breakfast 仓库；推送通过 cursor-remote-control 的 push-wecom-markdown.ts 走本地队列，避免 WebSocket 互踢。",
+  "workflow": {
+    "triggers": [{ "cron": { "cron": "30 8 * * *" } }],
+    "actions": [{ "mcp": { "server": { "name": "cn-financial" } } }],
+    "prompts": [
+      "【Automation · 仓库 wind-breakfast】\n\n0. **First** (from cursor-remote-control checkout): `bun run scripts/ensure-wecom-ws.ts` — WebSocket preflight, 3×5min retry.\n1. Read and follow `automation/AGENT_PROMPT.md`.\n2. After analysis, push via cursor-remote-control (uses local queue when wecom/server runs):\n   `bun run \"$CURSOR_REMOTE_CONTROL_ROOT/scripts/push-wecom-markdown.ts\" --title \"<标题>\" --file data/summaries/{DATE}-analysis.md`\n   Or run `python3 scripts/push_wecom.py --date {DATE}` (delegates to bun script when configured).\n\nSecrets: WECOM_BOT_ID, WECOM_BOT_SECRET, WECOM_CHAT_ID, CURSOR_REMOTE_CONTROL_ROOT (path to cursor-remote-control repo)."
+    ],
+    "gitConfig": { "repo": "<your-org>/wind-breakfast", "branch": "main" },
+    "memoryEnabled": true,
+    "agentOptions": { "skipInstall": false }
+  }
+}
